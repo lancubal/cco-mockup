@@ -1,0 +1,167 @@
+stages:
+- install
+- build
+- deploy
+- package
+- release
+
+Instalar Dependencias:
+  image: node:16.20.0
+  stage: install
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH || $CI_COMMIT_TAG
+  script:
+  - npm install
+  artifacts:
+    expire_in: 1 week
+    paths:
+    - node_modules 
+  cache:
+    key: $CI_COMMIT_REF_SLUG-$CI_PROJECT_DIR
+    paths:
+    - node_modules
+
+Construir el sitio DEV:
+  image: node:16.20.0
+  stage: build
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  cache:
+    key: $CI_COMMIT_REF_SLUG-$CI_PROJECT_DIR
+    paths:
+      - node_modules/
+    policy: pull
+  script:
+    - npm run build
+  artifacts:
+    expire_in: 1 week
+    paths:
+      - dist/
+
+Construir el sitio:
+  image: node:16.20.0
+  stage: build
+  rules:
+    - if: $CI_COMMIT_TAG
+  cache:
+    key: $CI_COMMIT_REF_SLUG-$CI_PROJECT_DIR
+    paths:
+      - node_modules/
+    policy: pull
+  script:
+    - echo "VITE_APP_SERVICE_URL=$VITE_APP_SERVICE_URL" >> .env.production
+    - echo "VITE_APP_SISTEMA_ORIGEN=$VITE_APP_SISTEMA_ORIGEN" >> .env.production
+    - echo "VITE_APP_AMBIENTE=$VITE_APP_AMBIENTE" >> .env.production
+    - echo "VITE_APP_LOGIN_URL=$VITE_APP_LOGIN_URL" >> .env.production
+    - npm run build
+  parallel:
+    matrix:
+      - VITE_APP_SERVICE_URL: $VITE_APP_SERVICE_URL_HML
+        VITE_APP_SISTEMA_ORIGEN: $VITE_APP_SISTEMA_ORIGEN_HML
+        VITE_APP_AMBIENTE: $VITE_APP_AMBIENTE_HML
+        VITE_APP_LOGIN_URL: $VITE_APP_LOGIN_URL_HML
+      - VITE_APP_SERVICE_URL: $VITE_APP_SERVICE_URL_PRD
+        VITE_APP_SISTEMA_ORIGEN: $VITE_APP_SISTEMA_ORIGEN_PRD
+        VITE_APP_AMBIENTE: $VITE_APP_AMBIENTE_PRD
+        VITE_APP_LOGIN_URL: $VITE_APP_LOGIN_URL_PRD
+      - VITE_APP_SERVICE_URL: $VITE_APP_SERVICE_URL_TST
+        VITE_APP_SISTEMA_ORIGEN: $VITE_APP_SISTEMA_ORIGEN_TST
+        VITE_APP_AMBIENTE: $VITE_APP_AMBIENTE_TST
+        VITE_APP_LOGIN_URL: $VITE_APP_LOGIN_URL_TST
+  artifacts:
+    expire_in: 1 week
+    paths:
+      - dist/
+
+Despliegue-dev:
+  image: alpine
+  stage: deploy
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual
+  environment:
+    name: develop
+    url: http://$IP_DEV_ENV
+  variables:
+    IP_ADDRESS: $IP_DEV_ENV
+  script:
+    - apk add --no-cache rsync openssh
+    - mkdir -p ~/.ssh
+    - echo "$SSH_PRIVATE_KEY_DEV" >> ~/.ssh/id_dsa
+    - chmod 600 ~/.ssh/id_dsa
+    - echo -e "Host *\n\tStrictHostKeyChecking no\n\n" > ~/.ssh/config
+    - ssh gitlab@$IP_ADDRESS "rm -rf /opt/visor-ee/*"
+    - rsync -avz -e "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null" --progress dist/* gitlab@$IP_ADDRESS:/opt/visor-ee
+
+Despliegue-tst:
+  image: alpine
+  stage: deploy
+  rules:
+    - if: $CI_COMMIT_TAG
+      when: manual
+  environment:
+    name: testing
+    url: http://$IP_TST_ENV
+  variables:
+    IP_ADDRESS: $IP_TST_ENV
+  script:
+    - apk add --no-cache rsync openssh
+    - mkdir -p ~/.ssh
+    - echo "$SSH_PRIVATE_KEY_TST" >> ~/.ssh/id_dsa
+    - chmod 600 ~/.ssh/id_dsa
+    - echo -e "Host *\n\tStrictHostKeyChecking no\n\n" > ~/.ssh/config
+    - ssh gitlab@$IP_ADDRESS "rm -rf /opt/visor-ee/*"
+    - rsync -avz -e "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null" --progress dist/* gitlab@$IP_ADDRESS:/opt/visor-ee
+
+Versionado:
+  stage: release
+  image: node:12.16.3
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^release-[0-9\.]*[a-zA-z]*-ARQ-[0-9]*/
+  before_script:
+    - NUMERO_VERSION_TAG=$(echo "$CI_COMMIT_BRANCH" | sed 's/release-//' | sed 's/-ARQ-[0-9]*//')
+    - NUEVO_TAG=visor-ee-$NUMERO_VERSION_TAG
+    - echo "$NUMERO_VERSION_TAG"
+    - echo "$NUEVO_TAG"
+    - git --version
+    - git config --global user.email "$GITLAB_USER_EMAIL"
+    - git config --global user.name "$GITLAB_USER_NAME"
+    - echo ${GITLAB_USER_NAME}
+    - echo ${GITLAB_USER_EMAIL}
+    - mkdir -p ~/.ssh
+    - echo "$SSH_DEPLOY_KEY_GDE" >> ~/.ssh/id_rsa
+    - chmod 600 ~/.ssh/id_rsa
+    - echo -e "Host *\n\tStrictHostKeyChecking no\n" > ~/.ssh/config
+    - ssh -T git@$CI_SERVER_HOST
+  script:
+    - VERSION_ACTUAL=$(node -p "require('./package.json').version")
+    - echo "$VERSION_ACTUAL"
+    - TWO_DOTS=':'
+    - sed -i "s/\"version\"$TWO_DOTS \"$VERSION_ACTUAL\"/\"version\"$TWO_DOTS \"$NUMERO_VERSION_TAG\"/g" package.json
+    - git add package.json
+    - git commit -am "Release $NUMERO_VERSION_TAG"
+    - git tag -d $(git tag)
+    - git tag $NUEVO_TAG
+    - git push git@$CI_SERVER_HOST:$CI_PROJECT_PATH.git $NUEVO_TAG
+    # Incremento versión y agrego SNAPSHOT
+    - NUEVA_VERSION_SNAPSHOT=$(cut -d . -f 3 <<< $NUMERO_VERSION_TAG)
+    - NUEVA_VERSION_SNAPSHOT=$(cut -d . -f 1 <<< $NUMERO_VERSION_TAG).$(cut -d . -f 2 <<< $NUMERO_VERSION_TAG).$(($NUEVA_VERSION_SNAPSHOT+1))-snapshot
+    - echo "$NUEVA_VERSION_SNAPSHOT"
+    - sed -i "s/\"version\"$TWO_DOTS \"$NUMERO_VERSION_TAG\"/\"version\"$TWO_DOTS \"$NUEVA_VERSION_SNAPSHOT\"/g" package.json
+    - git add package.json
+    - git commit -m "Versión dev $NUEVA_VERSION_SNAPSHOT [ci skip]"
+    # Creo el MR con dev de la nueva version con snapshot
+    - git push git@$CI_SERVER_HOST:$CI_PROJECT_PATH.git HEAD:$CI_COMMIT_BRANCH --push-option=merge_request.create  --push-option=merge_request.target=dev --push-option=merge_request.title="Merge $CI_COMMIT_BRANCH into dev" --push-option=merge_request.assign="$GITLAB_USER_LOGIN"
+
+Release:
+  stage: release
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  rules:
+    - if: $CI_COMMIT_TAG
+  script:
+    - echo 'Ejecutando versionado'
+  release:
+    name: '$CI_COMMIT_TAG'
+    tag_name: '$CI_COMMIT_TAG'
+    ref: '$CI_COMMIT_TAG'
+    description: './CHANGELOG.md'
